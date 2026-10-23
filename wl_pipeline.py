@@ -12,14 +12,12 @@ import pyccl as ccl
 from scipy.special import erf
 import matplotlib.pyplot as plt
 from itertools import combinations_with_replacement
-
-# ---------------- Configuración ----------------
 SURVEY = {  # parámetros del LSST DESC SRD
-    "Y1":  dict(z0=0.13, alpha=0.78, neff=10.0, fsky=12300 / 41253.),
-    "Y10": dict(z0=0.11, alpha=0.68, neff=27.0, fsky=14300 / 41253.),
+    "Y10": dict(z0=0.11, alpha=0.68, neff=30.0, fsky=0.35),
 }
+
 CFG = dict(
-    survey="Y1", nbins=5, sigma_z0=0.05, sigma_e=0.26,
+    survey="Y10", nbins=5, sigma_z0=0.05, sigma_e=0.26,
     A_IA=0.0,                        # 0 -> sin alineamientos intrínsecos
     ell_min=20, ell_max=3000, n_ell=20,
     transfer="boltzmann_camb",      # usa "eisenstein_hu" si no tienes CAMB
@@ -27,25 +25,20 @@ CFG = dict(
     pk_mode="modified",   # "ccl" (halofit estándar) | "modified" (halofit x S(k,a)) | "external" (archivo)
     pk_file="pk_external.npz",       # para "external": claves k, z, pk  (pk con shape (n_z, n_k))
     pk_h_units=False,                # True si el archivo está en k [h/Mpc], P [(Mpc/h)^3]
-    n_a=60, k_min=1e-4, k_max=50.0, n_k=400, pk_pars=dict(A_sup=0.2, k_sup=1.0)  # grilla para "modified" (k en 1/Mpc)
+    n_a=60, k_min=1e-4, k_max=50.0, n_k=400,   # grilla para "modified" (k en 1/Mpc)
 )
-
-
-COSMO = dict(Omega_c=0.2664, Omega_b=0.0492, h=0.6727, sigma8=0.831, n_s=0.9645)
-PARAMS = {
-    "Omega_c": ("cosmo", COSMO["Omega_c"], 0.10, 0.50),
-    "sigma8":  ("cosmo", COSMO["sigma8"],  0.50, 1.20),
-    "A_IA":    ("ia",    CFG["A_IA"],     -5.0,  5.0),
+COSMO = dict(Omega_c=0.2664, Omega_b=0.0492, h=0.6727, sigma8=0.831, n_s=0.9645,w0=-1)
+extra_params = {"camb": {
+        "halofit_version": "mead2020_feedback",
+        "HMCode_logT_AGN": 7.8,
+    }
+    
 }
-# Parámetros del P(k) propio: solo si tu pk_modifier los acepta vía CFG["pk_pars"]
-if CFG["pk_mode"] == "modified" and "pk_pars" in CFG:
-    PARAMS["A_sup"] = ("pk", CFG["pk_pars"]["A_sup"], 0.0, 0.8)
-
 
 # ---------------- n(z) ----------------
 def smail_nz(z, z0, alpha):
     nz = z**2 * np.exp(-(z / z0)**alpha)
-    return nz / np.trapz(nz, z)
+    return nz / np.trapezoid(nz, z)
 
 
 def tomographic_nz(z, nz, nbins, sigma_z0):
@@ -58,12 +51,12 @@ def tomographic_nz(z, nz, nbins, sigma_z0):
     for lo, hi in zip(edges[:-1], edges[1:]):
         w = 0.5 * (erf((hi - z) / (np.sqrt(2) * sig)) - erf((lo - z) / (np.sqrt(2) * sig)))
         n_i = nz * w
-        bins.append(n_i / np.trapz(n_i, z))
+        bins.append(n_i / np.trapezoid(n_i, z))
     return edges, np.array(bins)
 
 
 # ---------------- P(k, a) ----------------
-def pk_modifier(k, a, A_sup=0.2, k_sup=1.0):
+def pk_modifier(k, a):
     """S(k, a) que multiplica al P(k) no lineal. k en 1/Mpc, a escalar.
     Ejemplo de juguete: supresión de 20% a k >~ 1/Mpc. Reemplázalo por tu modelo."""
     return 1 - 0.2 / (1 + (k / 1.0)**-2)
@@ -80,7 +73,7 @@ def build_pk(cosmo, cfg, z_max):
         a = np.linspace(1 / (1 + z_max), 1, cfg["n_a"])
         k = np.geomspace(cfg["k_min"], cfg["k_max"], cfg["n_k"])
         pk0 = cosmo.get_nonlin_power()
-        P = np.array([pk0(k, ai) * pk_modifier(k, ai, **cfg["pk_pars"]) for ai in a])
+        P = np.array([pk0(k, ai) * pk_modifier(k, ai) for ai in a])
 
     elif mode == "external":
         d = np.load(cfg["pk_file"])
@@ -102,17 +95,18 @@ def build_pk(cosmo, cfg, z_max):
 
 
 # ---------------- Pipeline ----------------
-def run(cfg=CFG, cosmo_pars=COSMO):
+def run(cfg=CFG, cosmo_pars=COSMO,extra_params=extra_params):
     sv = SURVEY[cfg["survey"]]
     cosmo = ccl.Cosmology(**cosmo_pars, transfer_function=cfg["transfer"],
-                          matter_power_spectrum="halofit")
+                          matter_power_spectrum="halofit",extra_parameters=extra_params,
+    baryonic_effects=None,
+)
 
     z = np.linspace(1e-3, 3.5, 700)
     nz = smail_nz(z, sv["z0"], sv["alpha"])
     edges, nz_bins = tomographic_nz(z, nz, cfg["nbins"], cfg["sigma_z0"])
 
-    ia = (z, cfg["A_IA"] * np.ones_like(z)) if cfg["A_IA"] else None
-    tracers = [ccl.WeakLensingTracer(cosmo, dndz=(z, n), ia_bias=ia) for n in nz_bins]
+    tracers = [ccl.WeakLensingTracer(cosmo, dndz=(z, n), ia_bias=None) for n in nz_bins]
 
     # Bandas logarítmicas
     ell_edges = np.unique(np.geomspace(cfg["ell_min"], cfg["ell_max"], cfg["n_ell"] + 1).astype(int))
@@ -171,6 +165,20 @@ def plot(res, fname="wl_cls.png"):
         a_.set_xscale("log"); a_.set_yscale("log")
     fig.supxlabel(r"$\ell$"); fig.supylabel(r"$\ell(\ell+1)C_\ell/2\pi$")
     fig.tight_layout(); fig.savefig(fname, dpi=150)
+
+    plt.clf()
+    
+    covmat=res['cov']
+    std_devs = np.sqrt(np.diag(covmat))
+    outer_std = np.outer(std_devs, std_devs)
+    corr_matrix = covmat / outer_std
+    plt.imshow(covmat)
+    plt.colorbar()
+    plt.show()
+
+    plt.imshow(corr_matrix)
+    plt.colorbar()
+    plt.show()
 
     fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.plot(res["z"], res["nz"], "k", lw=1)
